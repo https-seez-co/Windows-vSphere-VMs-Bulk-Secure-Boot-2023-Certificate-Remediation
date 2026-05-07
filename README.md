@@ -30,12 +30,11 @@ fix is to delete the VM's NVRAM file and let ESXi regenerate it - ESXi 8.0.2 and
 later automatically populate the new NVRAM with the 2023 certificates. Windows can
 then detect and install them without requiring manual firmware enrollment.
 
-**Platform Key (PK) note:** Even after NVRAM regeneration, ESXi versions earlier
-than 9.0 write a placeholder PK into the new NVRAM rather than a proper
-Microsoft-signed key. Per [Broadcom KB 423919](https://knowledge.broadcom.com/external/article/423919),
-this placeholder PK will not authenticate future Windows Update KEK changes. The
-script detects this condition (`Valid_Other` status) and can enroll the correct
-Windows OEM Devices PK via UEFI SetupMode when `-PKDerPath` is provided.
+Per [Broadcom KB 423893](https://knowledge.broadcom.com/external/article/423893), after the June 2026 expiry VMs will continue to boot normally since Secure Boot verification does not check certificate expiration. The practical impact is that new DB and DBX update payloads signed solely by the 2023 KEK will fail on VMs that are still missing the 2023 KEK, and OS-driven KEK updates will fail on any VM without a valid PK. Existing payloads signed during the 2011 certificates' valid period continue to work regardless of expiry.
+
+**Platform Key (PK) note:** Even after NVRAM regeneration, ESXi 8.x writes a placeholder PK (`VMW.NULLPK`) rather than a proper Microsoft-signed key. ESXi 9.x newly created VMs receive the `WindowsOEMDevicesPK` automatically. Per KB 423893, Broadcom is working on automated PK update methods for ESXi 8.x in future patches, including silent PK update for vTPM-disabled VMs and capsule-based update for vTPM-enabled Windows VMs. Until those patches are available, the script can enroll the correct Windows OEM Devices PK via UEFI SetupMode when `-PKDerPath` is provided. The script detects placeholder PK status (`Valid_Other`) automatically.
+
+**Important:** Per [KB 423893](https://knowledge.broadcom.com/external/article/423893), PK enrollment requires **hardware version 14 or later**. Hardware version 21 is required for NVRAM regeneration to include the 2023 KEK and DB certificates. VMs on version 13 must be upgraded to at least 14 before PK enrollment is possible, and to 21 before NVRAM regeneration will include the 2023 certs.
 
 
 ---
@@ -44,6 +43,7 @@ Windows OEM Devices PK via UEFI SetupMode when `-PKDerPath` is provided.
 - [Microsoft KB5068202](https://support.microsoft.com/help/5068202) - AvailableUpdates registry key and monitoring
 - [Microsoft KB5068198](https://support.microsoft.com/help/5068198) - Group Policy deployment (requires Windows Server 2025 ADMX templates)
 - [Microsoft KB5085046](https://support.microsoft.com/en-us/kb/5085046) - Secure Boot troubleshooting guide; AvailableUpdates bit progression, event IDs, and failure scenarios (published March 2026)
+- [Broadcom KB 423893](https://knowledge.broadcom.com/external/article/423893) - Secure Boot Certificate Expirations and Update Failures in VMware Virtual Machines; includes FAQ on affected VMs, post-expiry impact, PK update methods, and planned automated remediation paths
 - [Broadcom KB 421593](https://web.archive.org/web/20260212085158/https://knowledge.broadcom.com/external/article/421593/missing-microsoft-corporation-kek-ca-202.html) - NVRAM rename procedure for missing KEK CA 2023 on Windows VMs *(Broadcom has removed this KB; link points to archive.org)*
 - [Broadcom KB 423919](https://knowledge.broadcom.com/external/article/423919) - Manual Update of the Secure Boot Platform Key in Virtual Machines
 
@@ -59,7 +59,7 @@ Windows OEM Devices PK via UEFI SetupMode when `-PKDerPath` is provided.
 
 ### VM Hardware Version
 - **Hardware version 13 or later** (introduced in vSphere 6.5) - required for EFI firmware and Secure Boot support
-- **Hardware version 14 or later** - required for vTPM (relevant to the BitLocker safety check)
+- **Hardware version 14 or later** - required for vTPM (relevant to the BitLocker safety check) and required for PK enrollment per [KB 423893](https://knowledge.broadcom.com/external/article/423893). VMs on version 13 must be upgraded to at least 14 before the `-PKDerPath` PK enrollment step will work
 - **Hardware version 21 or later** - required for ESXi to populate regenerated NVRAM with the 2023 KEK certificate. VMs on version 13-20 will have NVRAM regenerated but the KEK will not be present afterward; upgrade hardware version before running the script on these VMs
 - VMs below version 13 will be silently excluded by the EFI/Secure Boot filter and will not appear in the target list
 - Check hardware versions:
@@ -941,6 +941,16 @@ Per [KB5085046](https://support.microsoft.com/en-us/kb/5085046), there are two B
 **Repeated recovery due to PXE first boot**  -  if the VM is configured to attempt PXE boot before the local disk, BitLocker will enter recovery on every boot. This occurs because the PXE boot path is signed by the Microsoft UEFI CA 2011 while the on-disk Windows boot manager is now signed by the Windows UEFI CA 2023. BitLocker observes two different signing authorities during startup and cannot establish stable TPM measurements to reseal against.
 
 To resolve repeated PXE recovery: configure the firmware boot order so the local Windows boot manager boots first, or disable PXE if it is not required. If PXE is required, ensure the PXE infrastructure uses a 2023-signed Windows boot loader.
+
+### Scheduled tasks with stored passwords fail after remediation
+
+On vTPM-enabled VMs, the NVRAM rename changes Secure Boot variables which alters TPM PCR7 measurements. Windows uses DPAPI to encrypt stored credentials including scheduled task passwords. On machines where the DPAPI machine key is sealed to PCR7, those stored credentials become unreadable after a PCR7 change and Task Scheduler will report error `2147943726` (`ERROR_LOGON_FAILURE`).
+
+Scheduled tasks using gMSA accounts or tasks with no stored password are not affected since they don't rely on DPAPI-encrypted credentials. Credential Manager entries and other DPAPI-protected secrets may also be affected.
+
+The mitigation is to use `-SkipNVRAMRename` on vTPM-enabled VMs where the 2023 KEK certificate is already present in NVRAM (which is the case for VMs created on ESXi 8.0.2+). This avoids the PCR7 change entirely. The script will warn in yellow when a vTPM is detected without BitLocker active.
+
+If you encounter this after running the script, re-entering the stored passwords in Task Scheduler for the affected tasks will restore normal operation.
 
 ### Snapshot creation fails
 
