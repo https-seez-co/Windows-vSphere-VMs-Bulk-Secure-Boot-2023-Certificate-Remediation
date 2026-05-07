@@ -333,7 +333,7 @@ param(
     [switch]$UpgradeHardware
 )
 
-$ScriptVersion = "v1.7.4 / 2026-05-04"
+$ScriptVersion = "v1.7.5 / 2026-05-07"
 
 # =============================================================================
 # PARAMETER VALIDATION
@@ -647,18 +647,37 @@ function Get-VMDatastoreContext {
     $vmxPath = $vmView.Config.Files.VmPathName
     $dsName  = $vmxPath -replace '^\[(.+?)\].*',         '$1'
     $vmDir   = $vmxPath -replace '^\[.+?\] (.+)/[^/]+$', '$1'
-    $ds      = Get-Datastore -Name $dsName -ErrorAction Stop
+
+    # Resolve datastore by MoRef from the VM's own datastore list rather than
+    # by name. Get-Datastore -Name returns all datastores matching that name
+    # across the vCenter inventory which silently picks the wrong one when two
+    # datastores share a name (e.g. same-named datastores on different clusters).
+    $dsMoRef = $vmView.Datastore | Select-Object -First 1
+    $ds = if ($dsMoRef) {
+        Get-Datastore -Id $dsMoRef -ErrorAction SilentlyContinue
+    } $null
+    if (-not $ds) {
+        # Fallback to name lookup if MoRef resolution fails
+        $ds = Get-Datastore -Name $dsName -ErrorAction Stop | Select-Object -First 1
+    }
+
+    # Check for a custom nvram = path in the VMX ExtraConfig. When set, the
+    # NVRAM file may have a non-default name and the script must use that name
+    # rather than assuming *.nvram matches only the active file.
+    $nvramSetting = $vmView.Config.ExtraConfig | Where-Object { $_.Key -eq "nvram" }
+    $customNvramName = if ($nvramSetting) { $nvramSetting.Value } else { $null }
 
     $datacenter      = Get-Datacenter -VM $VMObj
     $datacenterView  = $datacenter | Get-View
     $serviceInstance = Get-View ServiceInstance
 
     return @{
-        DsName      = $dsName
-        VmDir       = $vmDir
-        DsBrowser   = Get-View $ds.ExtensionData.Browser
-        DcRef       = $datacenterView.MoRef
-        FileManager = Get-View $serviceInstance.Content.FileManager
+        DsName          = $dsName
+        VmDir           = $vmDir
+        DsBrowser       = Get-View $ds.ExtensionData.Browser
+        DcRef           = $datacenterView.MoRef
+        FileManager     = Get-View $serviceInstance.Content.FileManager
+        CustomNvramName = $customNvramName
     }
 }
 
@@ -989,7 +1008,11 @@ function Get-VMDatastoreSpaceInfo {
     try {
         $vmView  = $VMObj | Get-View
         $dsName  = ($vmView.Config.Files.VmPathName -replace '^\[(.+?)\].*', '$1')
-        $ds      = Get-Datastore -Name $dsName -EA Stop
+        $dsMoRef = $vmView.Datastore | Select-Object -First 1
+        $ds = if ($dsMoRef) {
+            Get-Datastore -Id $dsMoRef -ErrorAction SilentlyContinue
+        } $null
+        if (-not $ds) { $ds = Get-Datastore -Name $dsName -EA Stop | Select-Object -First 1 }
         $freeGB  = [math]::Round($ds.FreeSpaceGB, 2)
         $capGB   = [math]::Round($ds.CapacityGB, 2)
         $usedGB  = [math]::Round($capGB - $freeGB, 2)
@@ -1102,7 +1125,7 @@ function Rename-VMNvram {
     try {
         $ctx  = Get-VMDatastoreContext -VMObj $VMObj
         $spec = New-Object VMware.Vim.HostDatastoreBrowserSearchSpec
-        $spec.MatchPattern = "*.nvram"
+        $spec.MatchPattern = if ($ctx.CustomNvramName) { $ctx.CustomNvramName } else { "*.nvram" }
         $results = $ctx.DsBrowser.SearchDatastoreSubFolders(
             "[$($ctx.DsName)] $($ctx.VmDir)", $spec)
 
@@ -2102,7 +2125,9 @@ if ($CleanupSnapshots -or $CleanupHWSnapshots -or $CleanupNvram) {
             $vmDir   = $vmxPath -replace '^\[.+?\] (.+)/[^/]+$', '$1'
             try {
                 $dcRef     = (Get-Datacenter -VM $vm | Get-View).MoRef
-                $ds        = Get-Datastore -Name $dsName -ErrorAction Stop
+                $dsMoRef   = $vmView.Datastore | Select-Object -First 1
+                $ds        = if ($dsMoRef) { Get-Datastore -Id $dsMoRef -EA SilentlyContinue } $null
+                if (-not $ds) { $ds = Get-Datastore -Name $dsName -ErrorAction Stop | Select-Object -First 1 }
                 $dsBrowser = Get-View $ds.ExtensionData.Browser
                 $spec      = New-Object VMware.Vim.HostDatastoreBrowserSearchSpec
                 $spec.MatchPattern = "*.nvram_old"
@@ -2565,8 +2590,14 @@ foreach ($vm in $vms) {
                     }
                 }
                 if ($tpmData.TPMPresent -and -not $tpmData.BitLockerActive) {
-                    Write-Host "  vTPM present, BitLocker not active - proceeding." -ForegroundColor Yellow
-                    $row.Notes += "vTPM present. "
+                    Write-Host "  WARNING: vTPM is present on this VM." -ForegroundColor Yellow
+                    Write-Host "           The NVRAM rename changes Secure Boot variables which alters TPM PCR7" -ForegroundColor Yellow
+                    Write-Host "           measurements. On vTPM-enabled VMs, Windows DPAPI machine keys may be" -ForegroundColor Yellow
+                    Write-Host "           sealed to PCR7. If so, stored credentials (scheduled task passwords," -ForegroundColor Yellow
+                    Write-Host "           Credential Manager entries) may stop working after this run." -ForegroundColor Yellow
+                    Write-Host "           gMSA-based tasks and tasks with no stored password are unaffected." -ForegroundColor Yellow
+                    Write-Host "           Use -SkipNVRAMRename if this VM already has the 2023 KEK in NVRAM." -ForegroundColor Yellow
+                    $row.Notes += "vTPM present - DPAPI/stored credential risk if PCR7 changes. "
                 }
             } catch {
                 Write-Warning "  BitLocker check failed ($($_.Exception.Message)) - proceeding."
@@ -3300,3 +3331,5 @@ if ($noteVMs) {
         Write-Host "    $($n.Notes)"
     }
 }
+
+
