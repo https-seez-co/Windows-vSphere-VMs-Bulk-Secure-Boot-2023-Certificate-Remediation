@@ -2596,7 +2596,8 @@ foreach ($vm in $vms) {
                     Write-Host "           sealed to PCR7. If so, stored credentials (scheduled task passwords," -ForegroundColor Yellow
                     Write-Host "           Credential Manager entries) may stop working after this run." -ForegroundColor Yellow
                     Write-Host "           gMSA-based tasks and tasks with no stored password are unaffected." -ForegroundColor Yellow
-                    Write-Host "           Use -SkipNVRAMRename if this VM already has the 2023 KEK in NVRAM." -ForegroundColor Yellow
+                    Write-Host "           Note: if the 2023 KEK is already present in NVRAM the pre-check will" -ForegroundColor Yellow
+                    Write-Host "           skip the NVRAM rename automatically and this risk does not apply." -ForegroundColor Yellow
                     $row.Notes += "vTPM present - DPAPI/stored credential risk if PCR7 changes. "
                 }
             } catch {
@@ -3331,5 +3332,3 @@ if ($noteVMs) {
         Write-Host "    $($n.Notes)"
     }
 }
-
-
