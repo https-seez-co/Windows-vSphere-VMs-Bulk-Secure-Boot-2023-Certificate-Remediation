@@ -333,7 +333,7 @@ param(
     [switch]$UpgradeHardware
 )
 
-$ScriptVersion = "v1.7.6 / 2026-05-12"
+$ScriptVersion = "v1.7.7 / 2026-05-12"
 
 # =============================================================================
 # PARAMETER VALIDATION
@@ -405,8 +405,8 @@ if (-not $global:DefaultVIServer) {
     Connect-VIServer -Server $vcServer -Credential (Get-Credential -Message "vCenter credentials")
 }
 
-$isMainMode         = -not $CleanupSnapshots -and -not $CleanupHWSnapshots -and -not $CleanupNvram -and -not $Rollback -and -not $Assess -and -not ($UpgradeHardware -and -not $GuestCredential)
-$isStandaloneUpgrade = $UpgradeHardware -and -not $GuestCredential
+$isMainMode          = -not $CleanupSnapshots -and -not $CleanupHWSnapshots -and -not $CleanupNvram -and -not $Rollback -and -not $Assess
+$isStandaloneUpgrade = $UpgradeHardware -and -not $GuestCredential -and -not $isMainMode
 
 Write-Host "FixSecureBootBulk.ps1 $ScriptVersion" -ForegroundColor Cyan
 
@@ -432,7 +432,12 @@ if (-not $Confirm) {
 }
 Write-Host ""
 if ($isMainMode -and -not $GuestCredential) {
-    $GuestCredential = Get-Credential -Message "Guest OS credentials (domain admin)"
+    Write-Host "  Note: -GuestCredential not provided. Guest-level steps (BitLocker check," -ForegroundColor Yellow
+    Write-Host "        cert update trigger, verification, PK enrollment) will be skipped." -ForegroundColor Yellow
+    Write-Host "        Only hypervisor-level steps (snapshot, HW upgrade, NVRAM rename," -ForegroundColor Yellow
+    Write-Host "        power cycle) will run. Re-run with -GuestCredential to complete" -ForegroundColor Yellow
+    Write-Host "        the cert update and PK enrollment from a machine with guest access." -ForegroundColor Yellow
+    Write-Host ""
 }
 if ($Assess -and $GuestCredential) {
     Write-Host "Assess mode: guest-level data will be collected (cert status, registry, events, BitLocker)." -ForegroundColor Cyan
@@ -2547,7 +2552,7 @@ foreach ($vm in $vms) {
         # ------------------------------------------------------------------
         # Step 0 - BitLocker safety check (only if VM is powered on)
         # ------------------------------------------------------------------
-        if ($vm.PowerState -eq "PoweredOn") {
+        if ($vm.PowerState -eq "PoweredOn" -and $GuestCredential) {
             Write-Host "  [0/9] Checking BitLocker/TPM..." -ForegroundColor Cyan
             try {
                 $tpmOut  = Invoke-VMScript -VM $vm -ScriptText $tpmCheckScript `
@@ -2655,7 +2660,7 @@ foreach ($vm in $vms) {
         #   "allDone"    - VM fully remediated, skip entirely
         # ------------------------------------------------------------------
         $entryStep = "full"
-        if ($vm.PowerState -eq "PoweredOn") {
+        if ($vm.PowerState -eq "PoweredOn" -and $GuestCredential) {
             Write-Host "  [Pre] Assessing current state to determine required steps..." -ForegroundColor Cyan
             try {
                 $preOut  = Invoke-VMScriptViaFile -VM $vm -ScriptContent $assessGuestScript `
@@ -2795,8 +2800,12 @@ foreach ($vm in $vms) {
         # ------------------------------------------------------------------
         # Step 5 - Clear stale registry state, set AvailableUpdates, trigger task
         # (skipped if cert update already complete or only reboot needed)
+        # (skipped if no GuestCredential - hypervisor-only run)
         # ------------------------------------------------------------------
-        if ($entryStep -notin @("skipToStep6","certDone")) {
+        if (-not $GuestCredential) {
+            Write-Host "  [5-9/9] Skipping guest-level steps (no -GuestCredential provided)." -ForegroundColor Yellow
+            Write-Host "          Re-run with -GuestCredential to complete cert update and PK enrollment." -ForegroundColor Yellow
+        } elseif ($entryStep -notin @("skipToStep6","certDone")) {
         Write-Host "  [5/9] Clearing stale state and triggering update..." -ForegroundColor Cyan
         $updateOut = Invoke-VMScript -VM $vm -ScriptText $updateScript `
             -ScriptType Powershell -GuestCredential $GuestCredential -EA Stop
