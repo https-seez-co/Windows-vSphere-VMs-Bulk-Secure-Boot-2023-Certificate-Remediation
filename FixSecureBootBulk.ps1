@@ -333,7 +333,7 @@ param(
     [switch]$UpgradeHardware
 )
 
-$ScriptVersion = "v1.7.5 / 2026-05-07"
+$ScriptVersion = "v1.7.6 / 2026-05-12"
 
 # =============================================================================
 # PARAMETER VALIDATION
@@ -1301,9 +1301,14 @@ $WarningPreference     = 'SilentlyContinue'
 $ProgressPreference    = 'SilentlyContinue'
 $tpm = Get-Tpm
 $bl  = Get-BitLockerVolume | Where-Object { $_.ProtectionStatus -eq "On" }
+$vbs = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -EA SilentlyContinue
+$vbsRunning = ($null -ne $vbs -and $vbs.VirtualizationBasedSecurityStatus -eq 2)
+$cgRunning  = ($null -ne $vbs -and $vbs.SecurityServicesRunning -contains 1)
 [PSCustomObject]@{
     TPMPresent      = ($null -ne $tpm -and $tpm.TpmPresent)
     BitLockerActive = ($null -ne $bl -and @($bl).Count -gt 0)
+    VBSRunning      = $vbsRunning
+    CGRunning       = $cgRunning
 } | ConvertTo-Json -Compress
 '@
 
@@ -2188,8 +2193,12 @@ if ($CleanupSnapshots -or $CleanupHWSnapshots -or $CleanupNvram) {
     $nvramTotal = ($nvramFiles | Where-Object { -not $_.Skip } | Measure-Object -Property SizeKB -Sum).Sum
     Write-Host "Space reclaimed : $([math]::Round(($snapTotal + $nvramTotal / 1KB) / 1024, 2)) GB (approx)" -ForegroundColor Yellow
 
-    $confirmInput = Read-Host "`nProceed? (Y/N)"
-    if ($confirmInput -notmatch '^[Yy]') { Write-Host "Aborted."; return }
+    if (-not $Confirm) {
+        $confirmInput = Read-Host "`nProceed? (Y/N)"
+        if ($confirmInput -notmatch '^[Yy]') { Write-Host "Aborted."; return }
+    } else {
+        Write-Host "Proceed? (Y/N): y (auto-confirmed via -Confirm)" -ForegroundColor Gray
+    }
 
     # -------------------------------------------------------------------------
     # Step 1: Remove Pre-SecureBoot-Fix* snapshots (parallel across datastores)
@@ -2598,6 +2607,16 @@ foreach ($vm in $vms) {
                     Write-Host "           gMSA-based tasks and tasks with no stored password are unaffected." -ForegroundColor Yellow
                     Write-Host "           Note: if the 2023 KEK is already present in NVRAM the pre-check will" -ForegroundColor Yellow
                     Write-Host "           skip the NVRAM rename automatically and this risk does not apply." -ForegroundColor Yellow
+                    if ($tpmData.CGRunning) {
+                        Write-Host "  WARNING: Credential Guard is active on this VM." -ForegroundColor Yellow
+                        Write-Host "           Credential Guard seals its keys using the TPM. A PCR7 change may" -ForegroundColor Yellow
+                        Write-Host "           cause domain credential caching and pass-the-hash protection to" -ForegroundColor Yellow
+                        Write-Host "           reinitialize. Domain logins should continue to work but cached" -ForegroundColor Yellow
+                        Write-Host "           credentials may be flushed and VBS-protected secrets resealed." -ForegroundColor Yellow
+                    }
+                    if ($tpmData.VBSRunning) {
+                        $row.Notes += "VBS active - PCR7 change may affect VBS-sealed secrets. "
+                    }
                     $row.Notes += "vTPM present - DPAPI/stored credential risk if PCR7 changes. "
                 }
             } catch {
