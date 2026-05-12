@@ -948,6 +948,8 @@ On vTPM-enabled VMs, the NVRAM rename changes Secure Boot variables which alters
 
 Scheduled tasks using gMSA accounts or tasks with no stored password are not affected since they don't rely on DPAPI-encrypted credentials. Credential Manager entries and other DPAPI-protected secrets may also be affected.
 
+If Virtualization Based Security (VBS) or Credential Guard is active, the same PCR7 change may affect VBS-sealed secrets and cause Credential Guard to reinitialize. Domain logins should continue to work but cached credentials may be flushed and VBS-protected secrets resealed. The script detects VBS and Credential Guard status and will display a specific warning when either is active.
+
 If the 2023 KEK certificate is already present in the VM's NVRAM the script's smart step detection will skip the NVRAM rename automatically, meaning the PCR7 change does not occur and this issue will not arise. The script will warn in yellow when a vTPM is detected without BitLocker active.
 
 If you encounter this after running the script, re-entering the stored passwords in Task Scheduler for the affected tasks will restore normal operation.
