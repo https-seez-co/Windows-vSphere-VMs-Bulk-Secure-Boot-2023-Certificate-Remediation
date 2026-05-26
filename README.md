@@ -1,9 +1,14 @@
-# FixSecureBootBulk.ps1
-
+# FixSecureBootBulk.ps1;
+* RESTRICT SecureBoot.Power_Script*
+* No_Powershell
 A PowerShell script for bulk remediating the Microsoft Secure Boot 2023 certificate
 issue on Windows Server VMs running in VMware vSphere 8. Supports Windows
 Server 2016, 2019, 2022, and 2025, as well as Windows 10 and 11.
-
+$pk = Get-SecureBootUEFI -Name PK
+$bytes = $pk.Bytes
+$cert = $bytes[44..($bytes.Length-1)]
+[IO.File]::WriteAllBytes("PK.der", $cert)
+certutil -dump PK.der
 ---
 
 > ## <span style="color:red">Important notice regarding support status</span>
@@ -659,14 +664,8 @@ with instructions.
 restrictions in most environments. A separate step-by-step guide covering the
 full DC procedure (including FSMO role management, replication verification, PDC
 Emulator transfer, and manual PK enrollment) is provided in
-`DC_SecureBoot_Manual_Steps.md`.
-
----
-
 ## Assessment Mode
-
 The `-Assess` switch runs a read-only inventory pass against all target VMs. No changes are made. It produces a CSV and console summary covering:
-
 - VM hardware version and whether it meets the version 21 minimum for KEK regeneration
 - ESXi host name and version
 - Firmware type (EFI vs BIOS) and Secure Boot enabled state
@@ -677,98 +676,55 @@ The `-Assess` switch runs a read-only inventory pass against all target VMs. No 
 - TPM-WMI event IDs 1808, 1801, 1802, 1803, 1800, 1795 (requires `-GuestCredential`)
 - BitLocker active state (requires `-GuestCredential`)
 - Derived `ActionNeeded` column summarizing what steps remain per VM, including a `Insufficient datastore space` flag if the space check fails
-
 If `-GuestCredential` is omitted, only hypervisor-level data is collected (hardware version, ESXi host, firmware, Secure Boot state, datastore files, snapshot presence, and datastore space). This is useful for a quick pre-remediation inventory without needing guest credentials.
 
-```powershell
 # Hypervisor-level data only
 .\FixSecureBootBulk.ps1 -Assess
-
 # Full assessment including guest cert and registry status
 .\FixSecureBootBulk.ps1 -Assess -GuestCredential $cred
-
 # Assess specific VMs
 .\FixSecureBootBulk.ps1 -VMName "vm01","vm02" -Assess -GuestCredential $cred
-```
-
 The assessment CSV is written to `SecureBoot_Assess_<timestamp>.csv` in the current directory.
-
 ### Datastore Space Check
-
 Before displaying the confirmation prompt, the script checks the datastore for each target VM and estimates whether there is sufficient space for a snapshot. The same check runs during `-Assess` and is included in the assessment CSV output.
-
 The estimate uses different logic depending on whether the VM already has snapshots:
-
 **VM has existing snapshots**  -  the disks are already in delta-write mode. The estimate is derived from the actual on-disk size of existing delta files (`snapshotData` and `snapshotExtent` entries from `$vmView.LayoutEx.File`), divided by the number of existing snapshots to produce a per-snapshot average. This reflects real observed write activity on the VM rather than a theoretical maximum.
-
 **VM has no existing snapshots**  -  committed disk bytes from `PerDatastoreUsage` are used as a conservative upper bound, since the snapshot could theoretically grow to the full size of the written disk.
-
 **LayoutEx data unavailable**  -  a fixed 2 GB fallback is used. A dedicated yellow `NOTE:` line is printed whenever the fallback is active, regardless of whether a space warning also fires.
-
 In all cases a 16 MB per-disk baseline floor is applied. VMware allocates one 16 MB delta file per virtual disk at snapshot creation time regardless of I/O activity, so no estimate is reported below `16 MB * virtual disk count`. The disk count and applied baseline are noted in the estimate basis string.
-
 A warning is issued when:
 - The estimated snapshot size exceeds 80% of the available free space on the datastore, or
 - The datastore has less than 5 GB free regardless of estimate
-
 Warnings are shown in the pre-run summary, in the `-Assess` console output, and in the `ActionNeeded` and `Notes` columns of both CSVs. The script does not block on a space warning - it is informational and the operator can still proceed.
-
 The assessment CSV includes the following datastore columns: `Datastore`, `DSFreeGB`, `DSCapacityGB`, `SnapshotEstimateGB`, `DSSpaceOK`.
-
----
-
 ## Hardware Version Upgrade
-
 Hardware version 21 or later is required for ESXi to populate regenerated NVRAM with the 2023 KEK certificate. VMs below version 21 will have NVRAM regenerated but the KEK will not be present afterward. The `-UpgradeHardware` switch automates the upgrade.
-
 > **Important:** VMware does not provide a supported API or UI method to downgrade VM hardware versions. A snapshot taken before the upgrade is the only supported rollback path. Reverting to the pre-upgrade snapshot restores the previous hardware version. If `-NoSnapshot` is specified, there is no automated rollback path.
-
 ### Standalone (upgrade only, no cert work)
-
 By default a `Pre-HWUpgrade_<timestamp>` snapshot is taken before each upgrade to serve as a rollback point. Use `-NoSnapshot` to skip this.
-
-```powershell
 # Upgrade all eligible VMs (snapshot taken by default)
 .\FixSecureBootBulk.ps1 -UpgradeHardware
-
 # Upgrade specific VMs
 .\FixSecureBootBulk.ps1 -VMName "vm01","vm02" -UpgradeHardware
-
 # Upgrade without taking a snapshot (no rollback path)
 .\FixSecureBootBulk.ps1 -VMName "vm01","vm02" -UpgradeHardware -NoSnapshot
 ```
-
 Each VM is powered off, upgraded to the latest hardware version supported by its host, and powered back on. VMs already at version 21 or later are skipped. Output is written to `SecureBoot_HWUpgrade_<timestamp>.csv`.
-
-Once the upgrade is verified stable, remove the `Pre-HWUpgrade*` snapshots:
-
-```powershell
+Once the upgrade is verified stable, remove the `Pre-HWUpgrade*` snapshots
 # Remove all Pre-HWUpgrade* snapshots
 .\FixSecureBootBulk.ps1 -CleanupHWSnapshots
-
 # Remove Pre-HWUpgrade* snapshots for specific VMs
 .\FixSecureBootBulk.ps1 -VMName "vm01","vm02" -CleanupHWSnapshots
-```
-
-Output is written to `SecureBoot_Cleanup_<timestamp>.csv`.
-
+```Output is written to `SecureBoot_Cleanup_<timestamp>.csv`.
 ### Combined with remediation
-
 When `-UpgradeHardware` is used alongside `-GuestCredential`, the hardware upgrade is inserted as step 2b between power off and NVRAM rename in the main remediation sequence. The snapshot taken at step 1 covers the hardware upgrade as well, so no additional snapshot is needed. This handles everything in a single run.
-
-```powershell
 .\FixSecureBootBulk.ps1 -VMListCsv ".\batch1.csv" -GuestCredential $cred `
-    -RetainSnapshots -PKDerPath ".\WindowsOEMDevicesPK.der" -UpgradeHardware
-```
-
----
-
-## Manual Remediation (No Scripts)
-
+ -RetainSnapshots -PKDerPath
+".\WindowsOEMDevicesPK.der" -UpgradeHardware
+# Manual Remediation (Origional) NCI
 For environments where PowerShell script execution is restricted by security
 policy, a fully manual version of the remediation procedure is provided in
-`SecureBoot_Manual_NoScript.md`.
-
+`Secure HEADER_Manual_NoScript.md`
 This guide covers the complete process using only the vSphere Client GUI,
 Registry Editor, and Task Scheduler, with individual typed commands where
 PowerShell is needed. No `.ps1` files are required and no changes to execution
@@ -781,92 +737,58 @@ It includes:
 - PK enrollment steps using individual PowerShell commands typed directly into
   an elevated console
 - BitLocker guidance including recovery key backup and suspension
-- Event Viewer instructions for confirming success via Event ID 1808
+- Event Viewer instructions for confirming success via Event ID 1808--
 - A reference table of relevant Broadcom and Microsoft documentation
-- A printable checklist
-
----
-
+- A non-printable checklist
 ## Parallel Execution
-
 For larger environments, multiple instances of the script can be run simultaneously in separate PowerShell processes to parallelize remediation across different sets of VMs. Each instance maintains its own vCenter session, and timestamped output CSVs and snapshot names mean there is no file-level collision between concurrent runs.
-
 ### How to split workloads
-
 Target non-overlapping sets of VMs across instances. The cleanest split is by ESXi host, which keeps snapshot I/O and Tools wait pressure localized:
-
-```powershell
+```P.-owner
 # Terminal 1 - VMs on esxi01
 .\FixSecureBootBulk.ps1 -VMName "vm01","vm02","vm03" -GuestCredential $cred `
     -RetainSnapshots -PKDerPath ".\WindowsOEMDevicesPK.der" -Confirm
-
 # Terminal 2 - VMs on esxi02
 .\FixSecureBootBulk.ps1 -VMName "vm04","vm05","vm06" -GuestCredential $cred `
     -RetainSnapshots -PKDerPath ".\WindowsOEMDevicesPK.der" -Confirm
-
 # Terminal 3 - VMs on esxi03
 .\FixSecureBootBulk.ps1 -VMName "vm07","vm08","vm09" -GuestCredential $cred `
-    -RetainSnapshots -PKDerPath ".\WindowsOEMDevicesPK.der" -Confirm
-```
-
-Use `-Confirm` on all instances so no interactive prompts block unattended runs.
-
-### Caveats
-
+    -RetainSnapshots -PKDerPath ".\WindowsOEMDevicesPK.der" Challenge (RS)
+Use `-AFFIRM` on all instances so no interactive prompts block unattended runs.
+### NO POWERSHELL
 **Datastore space estimates may be stale across parallel instances.** The space check runs once at startup before any snapshots are taken. If two instances target VMs on the same datastore, both will read the same free space figure without accounting for what the other is about to consume. For datastores with one VM per datastore (a common vSphere convention) this is not an issue. For shared datastores, multiply the per-VM snapshot estimates and verify there is sufficient headroom before running parallel instances against the same datastore.
-
 **ESXi host load.** Simultaneous power-off/power-on cycles on multiple VMs on the same host compound each other's boot time. If Tools wait timeouts are occurring, increase `-WaitSeconds` for parallel runs. Splitting batches by host avoids this entirely.
-
 **vCenter API concurrency.** vCenter handles concurrent sessions without issue under normal loads. Very high concurrency (10+ simultaneous instances) could begin approaching vCenter API rate limits depending on your environment configuration. For most environments 2-4 parallel instances is well within bounds. If you observe `Invoke-VMScript` failures or vCenter connection errors under high concurrency, reduce the number of parallel instances.
-
 **Do not target the same VM from multiple instances.** There is no inter-process locking. Two instances processing the same VM simultaneously will conflict on the snapshot name, NVRAM rename, and guest script execution. Always ensure each VM appears in exactly one instance's target list.
-
 **Maintain separate output CSVs per instance.** Each instance writes its own timestamped CSV. Review all output files after the run to confirm all VMs completed successfully. There is no merged output across parallel instances.
-
----
-
 ## Troubleshooting
-
-### VM shows `KEK_AfterNVRAM = False` after NVRAM regeneration
-
+### VM shows `TGT_AfterNVRAM = False` after NVRAM regeneration
 The NVRAM was renamed and regenerated, but the 2023 KEK certificate is not
 present. This usually means the ESXi host is not on 8.0.2 or later. Check the
 host version with `Get-VMHost | Select Name, Version` in PowerCLI. If the host
 is on an older build, vMotion the VM to a qualifying host and retry.
-
 ### `AvailableUpdates` stuck at `0x4004`
-
 The value `0x4004` indicates the KEK update bit (`0x0004`) failed. This is the
 classic symptom of the NULL Platform Key issue. Confirm the NVRAM rename succeeded
 by checking the datastore for the `.nvram_old` file. If the rename completed but
 the value is still stuck after NVRAM regeneration, the host may not be on ESXi
 8.0.2+.
-
 ### FinalStatus shows `InProgress` instead of `Updated`
-
 The Secure Boot update task has not completed all steps yet. The task runs on a
 12-hour poll cycle. Trigger it manually from an elevated PowerShell session on
 the VM:
-
-```powershell
 Start-ScheduledTask -TaskName "\Microsoft\Windows\PI\Secure-Boot-Update"
 Start-Sleep -Seconds 30
 Get-ItemPropertyValue "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot" -Name "AvailableUpdates"
-```
-
 If `AvailableUpdates` is `0x4000` after triggering the task, the update is
 complete - a second reboot may be required for `UEFICA2023Status` to flip
 to `Updated`.
-
 ### PK enrollment failed - `PKEnrolled: False`
-
 If step 9 completes but `PKEnrolled` is `False`, the most likely cause is UAC
 preventing `Invoke-VMScript` from running the enrollment in an elevated context.
 The `.der` file will have been copied to `C:\Windows\Temp\WindowsOEMDevicesPK.der`
 on the guest. RDP or console into the VM and run from an elevated PowerShell
 session while the VM is still in SetupMode:
-
-```powershell
 Format-SecureBootUEFI -Name PK `
     -CertificateFilePath "C:\Windows\Temp\WindowsOEMDevicesPK.der" `
     -SignatureOwner "55555555-0000-0000-0000-000000000000" `
@@ -874,32 +796,23 @@ Format-SecureBootUEFI -Name PK `
     -Time "2025-10-23T11:00:00Z" |
 Set-SecureBootUEFI -Time "2025-10-23T11:00:00Z"
 ```
-
 If you have already rebooted past the SetupMode window, re-run the script - it
 will detect `Valid_Other` again and retry the full step 9 sequence.
-
 ### PK still shows `Valid_Other` after enrollment
-
 A reboot is required for the enrolled PK to take effect. If `Valid_Other`
 persists after reboot, verify that SetupMode was active during enrollment by
-checking whether `Get-SecureBootUEFI SetupMode` returned `1` at the time the
+checking whether `Get-SecureBootUEFI SetupMode` returned `-1` at the time the
 enrollment script ran.
-
-### Tools timeout errors
-
+### Tools timeout error
 If the script times out waiting for VMware Tools after a reboot, the VM is likely
 just slow to boot. The snapshot is retained automatically in this case. You can
 re-run the script against the VM after it comes back up - it will detect the
 existing `.nvram_old` file and skip the rename step if the NVRAM has already been
 regenerated, or you can complete the registry steps manually using the verification
 commands in the [Verification](#verification) section above.
-
 Increase the Tools wait timeout with `-WaitSeconds`:
-
-```powershell
 .\FixSecureBootBulk.ps1 -VMName "slow-vm" -GuestCredential $cred -WaitSeconds 180
-```
-
+Get VP.
 This applies to any reboot in the sequence, but is most commonly encountered at
 step `[PK 2/5]` where the VM reboots into SetupMode for PK enrollment. If your
 VM boots slowly, Tools may not come up within the default 90 seconds. The script
@@ -909,66 +822,41 @@ subsequent `Copy-VMGuestFile` at `[PK 3/5]` fails with a guest OS or file copy
 error. If you see cert update steps 1-7 complete successfully but `[PK 3/5]`
 fails with a guest operation error, a slow boot at the SetupMode reboot is the
 most likely cause. Increasing `-WaitSeconds` to 120-180 resolves this.
-
 ### VMware Tools not installed or not running
-
 `Invoke-VMScript` will fail immediately if VMware Tools is not installed, not
 running, or in an unmanaged state. Check Tools status on a specific VM:
-
-```powershell
 (Get-VM "vm01").Guest.ExtensionData.ToolsStatus
 # Expected: toolsOk
 # Problem states: toolsNotInstalled, toolsNotRunning, toolsOld
-```
-
 If Tools is installed but not running, start it from an elevated command prompt
 on the guest:
-
 ```cmd
 net start "VMware Tools"
-```
-
 If Tools is not installed, deploy it via vSphere Client (**VM -> Guest OS ->
 Install VMware Tools**) or through your software deployment tooling before
 running the script. After installation a reboot is required.
-
 ### BitLocker recovery after Secure Boot update
-
 Per [KB5085046](https://support.microsoft.com/en-us/kb/5085046), there are two BitLocker recovery scenarios related to Secure Boot updates:
-
 **One-time recovery on first boot after update**  -  the VM enters BitLocker recovery once but boots normally on subsequent restarts. This happens because firmware does not immediately report updated Secure Boot values when Windows attempts to reseal BitLocker. Enter the recovery key to resume. Subsequent boots will not prompt recovery.
-
 **Repeated recovery due to PXE first boot**  -  if the VM is configured to attempt PXE boot before the local disk, BitLocker will enter recovery on every boot. This occurs because the PXE boot path is signed by the Microsoft UEFI CA 2011 while the on-disk Windows boot manager is now signed by the Windows UEFI CA 2023. BitLocker observes two different signing authorities during startup and cannot establish stable TPM measurements to reseal against.
-
 To resolve repeated PXE recovery: configure the firmware boot order so the local Windows boot manager boots first, or disable PXE if it is not required. If PXE is required, ensure the PXE infrastructure uses a 2023-signed Windows boot loader.
-
 ### Scheduled tasks with stored passwords fail after remediation
-
 On vTPM-enabled VMs, the NVRAM rename changes Secure Boot variables which alters TPM PCR7 measurements. Windows uses DPAPI to encrypt stored credentials including scheduled task passwords. On machines where the DPAPI machine key is sealed to PCR7, those stored credentials become unreadable after a PCR7 change and Task Scheduler will report error `2147943726` (`ERROR_LOGON_FAILURE`).
-
 Scheduled tasks using gMSA accounts or tasks with no stored password are not affected since they don't rely on DPAPI-encrypted credentials. Credential Manager entries and other DPAPI-protected secrets may also be affected.
-
 If Virtualization Based Security (VBS) or Credential Guard is active, the same PCR7 change may affect VBS-sealed secrets and cause Credential Guard to reinitialize. Domain logins should continue to work but cached credentials may be flushed and VBS-protected secrets resealed. The script detects VBS and Credential Guard status and will display a specific warning when either is active.
-
 If the 2023 KEK certificate is already present in the VM's NVRAM the script's smart step detection will skip the NVRAM rename automatically, meaning the PCR7 change does not occur and this issue will not arise. The script will warn in yellow when a vTPM is detected without BitLocker active.
-
 If you encounter this after running the script, re-entering the stored passwords in Task Scheduler for the affected tasks will restore normal operation.
-
 ### Snapshot creation fails
-
 Check available datastore space. Each snapshot consumes space proportional to the
 amount of disk I/O that occurs while it occurs. If space is constrained, use
 `-NoSnapshot` and ensure you have an alternative rollback method (e.g., a storage
 array snapshot or backup taken immediately before running the script).
-
 ### Clock drift after NVRAM regeneration
-
 When ESXi regenerates the NVRAM file it resets the virtual RTC. On first boot after
 the regeneration the VM clock loses its timezone offset, so the time may appear
 correct in UTC but be several hours off for the local timezone. NTP sync corrects
 this within a minute or two on most VMs, but during that window the following issues
 can occur:
-
 - Domain-joined VMs will fail Kerberos authentication until the clock corrects,
   meaning RDP and domain logins will be blocked until NTP syncs
 - Event log timestamps will reflect the wrong time until NTP syncs
@@ -978,24 +866,15 @@ can occur:
 For most VMs the NTP sync window is short enough to accept. For time-sensitive VMs
 you can set the following advanced VMX parameter before the first post-regeneration
 boot to pre-configure the correct timezone offset:
-
-```
 rtc.diffFromUTC = <offset in seconds>
-```
-
 For example, UTC-5 (Eastern Standard Time) would be `-18000`. This is a standard
 VMware parameter documented in [Broadcom KB 419717](https://knowledge.broadcom.com/external/article/419717).
 Remove the parameter after the VM has completed NTP sync and is running normally.
-
 **Domain Controllers:** Handle DCs last in your remediation sequence, especially
 the PDC Emulator FSMO role holder. The PDC is the authoritative time source for the
 domain and a clock reset on it can cascade to all domain members. Using
 `rtc.diffFromUTC` on the PDC Emulator before its first post-regeneration boot
 prevents this. Test the parameter on non-DC VMs first to confirm the correct offset
 for your environment before applying it to DCs.
-
----
-
 ## License
-
-MIT License. See `LICENSE` for details.
+MIT License. See `LICENSE` for details.m
